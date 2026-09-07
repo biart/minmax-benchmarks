@@ -1,0 +1,10 @@
+build/
+build-vs/
+out/
+.vs/
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.cod
+*.asm

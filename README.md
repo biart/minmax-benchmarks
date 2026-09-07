@@ -1,0 +1,132 @@
+# minmax-benchmarks
+
+Benchmarks and disassembly probes for [microsoft/STL#6404](https://github.com/microsoft/STL/issues/6404) —
+*`ranges::min`, `ranges::max` and `ranges::minmax` evaluate each element twice*.
+
+`ranges::min`/`max`/`minmax` choose between scanning with an iterator and caching a
+`range_value_t`, using this heuristic in [`<xutility>`](https://github.com/microsoft/STL/blob/eae5df4/stl/inc/xutility#L7540):
+
+```cpp
+template <class _It>
+concept _Prefer_iterator_copies =
+    sizeof(_It) <= 2 * sizeof(iter_value_t<_It>)
+    && (is_trivially_copyable_v<_It> || !is_trivially_copyable_v<iter_value_t<_It>>);
+```
+
+This repository exists to find out what that choice actually costs, and whether `sizeof(_It)` is
+the right thing to key it on.
+
+## What is measured
+
+Each algorithm is transcribed from the shipping sources into `inc/minmax_tracks.hpp`, with the
+vectorized fast paths and the `_Prefer_iterator_copies` fork removed and replaced by an explicit
+compile-time `track` selector. Every track computes the same answer and performs exactly `N - 1`
+comparisons; they differ in how often they dereference.
+
+With `N` the number of elements and `I` the number of times the running result is replaced
+(`≈ ln N` for random data, `0` when the first element is already the answer, `N - 1` for the
+adverse ordering):
+
+| track | dereferences | what it is |
+| --- | --- | --- |
+| `iter` | `2N - 1` | the STL's iterator branch (`_Min_element_unchecked`), vectorization removed |
+| `value` | `N + I` | the STL's value branch — re-dereferences `*first` on improvement |
+| `value1x` | `N` | libstdc++'s loop — binds `auto&&` once and forwards from it |
+| `iter_hoist` | `N + I + 1` | *a model, not a candidate*: the iterator branch as it would compile if MSVC hoisted the loop-invariant `*found` ([DevCom-11139307](https://developercommunity.visualstudio.com/t/MSVC-Optimizer-does-not-keep-a-loop-carr/11139307)) |
+| `ref_1x` | `N` | caches a handle rather than the element: a pointer when `Ref` is a reference, the proxy when `Ref` is a proxy, the value when `Ref` is a prvalue of `V` |
+| `stl` | — | control: whatever the installed `std::ranges::*` does today |
+
+The `stl` control is what validates the transcriptions — it lands on whichever of `iter`/`value`
+the shipping heuristic selects, in every configuration.
+
+## Building
+
+Requires Visual Studio 2022 or newer with the C++ workload, and CMake 4.3.1+.
+
+The benchmarks reuse `google-benchmark` and `skewed_allocator.hpp` from the STL's own benchmark
+suite, so a checkout of microsoft/STL is needed alongside this one:
+
+```
+git clone https://github.com/microsoft/STL.git ../STL
+git -C ../STL submodule update --init --depth 1 benchmarks/google-benchmark
+```
+
+Then, from a Developer Command Prompt:
+
+```
+cmake -S . -B build
+cmake --build build --config Release
+```
+
+Useful configure options:
+
+- `-DSTL_SOURCE_DIR=C:/src/STL` if the STL checkout is somewhere other than `../STL`
+- `-DSTL_BINARY_DIR=C:/src/STL/out/build/x64` to measure a locally built STL instead of the
+  installed one, which is what you want in order to A/B an actual header change
+
+## Running
+
+| target | what it covers |
+| --- | --- |
+| `build\bench-scenarios.exe` | the main matrix: element size, data ordering, `string`, `zip`, `join`, `join \| transform`, large prvalues, expensive reference derefs |
+| `build\bench-size_map.exe` | `sizeof(It)` × `sizeof(V)` sweep with a synthetic `fat_iterator`, plus real-range anchors |
+| `build\bench-ranges_minmax.exe` | a self-contained benchmark in the STL suite's own style, intended for upstreaming as `benchmarks/src/ranges_minmax.cpp` — it calls the public API only |
+| `build\probe.exe` | which branch the installed STL takes for each element type, and whether the vectorized paths apply |
+| `build\iterators.exe` | `sizeof`, reference-ness and heuristic verdict for real ranges and views |
+| `build\zip_types.exe` | why `zip`'s `iter_value_t` cannot be a tuple of references |
+| `build\asm_probe.exe` | per-track timings for synthetic iterators and element sizes, one noinline function each |
+| `build\asm_real.exe` | the same for real ranges (vector, deque, join, iota, transform) |
+
+Margins are often small, so prefer:
+
+```
+build\bench-scenarios.exe --benchmark_repetitions=7 --benchmark_report_aggregates_only=true
+```
+
+The `asm_probe` and `asm_real` targets are compiled with `/FAcs`, so building them also writes
+annotated assembly listings to `build\asm_probe.cod` and `build\asm_real.cod`. Several conclusions
+here rest on reading those listings rather than on timings alone.
+
+## Layout
+
+```
+inc/minmax_tracks.hpp   the tracks, transcribed from microsoft/STL and libstdc++
+inc/synthetic.hpp       sized_value<Bytes> and fat_iterator<T, Bytes, fatness>
+src/scenarios.cpp       the main matrix
+src/size_map.cpp        the iterator-size / value-size sweep
+upstream/               the benchmark proposed for the STL's own suite
+probe/                  disassembly and type-inspection probes
+```
+
+## Findings, in brief
+
+- **`sizeof(_It)` does not predict anything.** Synthetic iterators of 8, 16, 32 and 64 bytes emit
+  byte-identical loops; the padding is scalarized away and the iterator lives in one register
+  regardless. Real iterators differ because their *dereference* differs, not their size.
+- **What costs is the dereference count**, and its price is user-controlled and unbounded — a
+  `views::transform` can put an allocation or a nested reduction behind `*it`.
+- The iterator branch is additionally penalised on MSVC today because `*found` is reloaded through
+  a `cmov`-updated pointer, putting a load on the loop-carried dependency chain. `iter_hoist`
+  isolates how much of the gap that accounts for.
+- Caching values loses only when the assignment is a *copy* rather than a move **and** the input is
+  close to sorted. `vector<string>`, `zip`, and prvalues larger than the register file are the
+  cases where it happens.
+
+## Caveats
+
+Everything here was measured on one machine: MSVC 19.51 x64, `/O2`, no `/arch:` flag. No clang-cl,
+no ARM64. Most rows benchmark `min` only. Some numbers depend on hardware more than they look —
+the auto-vectorization seen in `probe/asm_probe.cpp` is dispatched at runtime on
+`__isa_available >= 6` (AVX-512), so the same binary takes a scalar path elsewhere.
+
+Four measurement artifacts were found and fixed during this work, each of which produced a
+plausible but meaningless number: a defaulted `operator<=>` adding five instructions to the
+loop-carried chain (see `probe/spaceship_repro.cpp` and `probe/devcom_comment.md`), dead padding in
+a synthetic iterator being deleted outright, a struct payload elided on the comparison-only path,
+and the AVX-512 dispatch above. If you extend these benchmarks, check the disassembly before
+trusting a result.
+
+## License
+
+`upstream/ranges_minmax.cpp` is written for submission to microsoft/STL and carries that project's
+Apache-2.0 WITH LLVM-exception header. The rest of the repository has no license chosen yet.
