@@ -74,4 +74,5 @@ add_asm_tool(asm_real probe/asm_real.cpp)
 
 add_bench(size_map src/size_map.cpp)
 add_bench(scenarios src/scenarios.cpp)
+add_bench(summary src/summary.cpp)
 add_bench(ranges_minmax upstream/ranges_minmax.cpp)
