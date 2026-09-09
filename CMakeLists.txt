@@ -66,6 +66,7 @@ function(add_asm_tool name)
 endfunction()
 
 add_tool(probe probe/probe.cpp)
+add_tool(verdicts probe/verdicts.cpp)
 add_tool(iterators probe/iterators.cpp)
 add_tool(zip_types probe/zip_types.cpp)
 

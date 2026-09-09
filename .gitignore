@@ -8,3 +8,5 @@ out/
 *.ilk
 *.cod
 *.asm
+build-*/
+stl-snapshots/

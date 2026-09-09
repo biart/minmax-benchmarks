@@ -44,7 +44,34 @@
 
 enum class Shape { Random, Adverse };
 
-enum class Kind { Vec, Str, Deque, Join, Zip, Transform, Prvalue32, Prvalue64, Prvalue256, Iota, ExpensiveRef };
+enum class Kind {
+    Vec, Str, Deque, Join, Zip, Transform,
+    Prvalue16, Prvalue24, Prvalue32, Prvalue64, Prvalue256,
+    FatIter16, FatIter32, FatIter64,
+    Iota, ExpensiveRef,
+};
+
+template <Kind K>
+constexpr size_t prvalue_bytes() {
+    if constexpr (K == Kind::Prvalue16) {
+        return 16;
+    } else if constexpr (K == Kind::Prvalue24) {
+        return 24;
+    } else if constexpr (K == Kind::Prvalue32) {
+        return 32;
+    } else if constexpr (K == Kind::Prvalue64) {
+        return 64;
+    } else {
+        return 256;
+    }
+}
+
+template <Kind K>
+constexpr bool is_prvalue_kind = K == Kind::Prvalue16 || K == Kind::Prvalue24 || K == Kind::Prvalue32
+                              || K == Kind::Prvalue64 || K == Kind::Prvalue256;
+
+template <Kind K>
+constexpr bool is_fatiter_kind = K == Kind::FatIter16 || K == Kind::FatIter32 || K == Kind::FatIter64;
 
 using namespace std;
 
@@ -160,8 +187,20 @@ void bm(benchmark::State& state) {
             auto transformed = data | views::transform([](const double x) { return x * 1.0000001; });
             benchmark::DoNotOptimize(ranges::min(transformed));
         }
-    } else if constexpr (K == Kind::Prvalue32 || K == Kind::Prvalue64 || K == Kind::Prvalue256) {
-        constexpr size_t bytes = (K == Kind::Prvalue32) ? 32 : ((K == Kind::Prvalue64) ? 64 : 256);
+    } else if constexpr (is_fatiter_kind<K>) {
+        // Ref is `double&` and V is 8 bytes, so ONLY sizeof(It) varies. The old heuristic sends
+        // 32- and 64-byte iterators to the value branch; Step 1 sends every reference range to
+        // the iterator branch. Adverse ordering maximises the iterator copies (I = N - 1).
+        constexpr size_t itbytes = (K == Kind::FatIter16) ? 16 : ((K == Kind::FatIter32) ? 32 : 64);
+        using It                 = mmb::fat_iterator<double, itbytes, mmb::fatness::live>;
+        auto data                = make_doubles(n, S);
+        for (auto _ : state) {
+            benchmark::DoNotOptimize(data);
+            auto r = ranges::subrange(It::at(data.data(), 0), It::at(data.data(), static_cast<ptrdiff_t>(n)));
+            benchmark::DoNotOptimize(ranges::min(r));
+        }
+    } else if constexpr (is_prvalue_kind<K>) {
+        constexpr size_t bytes = prvalue_bytes<K>();
         using Big              = mmb::sized_value<bytes>;
         auto data              = make_values<bytes>(n, S);
         for (auto _ : state) {
@@ -208,10 +247,20 @@ BENCHMARK(bm<Kind::Zip, Shape::Random>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Zip, Shape::Adverse>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Transform, Shape::Random>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Transform, Shape::Adverse>)->Apply(common_arg);
+BENCHMARK(bm<Kind::Prvalue16, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::Prvalue16, Shape::Adverse>)->Apply(common_arg);
+BENCHMARK(bm<Kind::Prvalue24, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::Prvalue24, Shape::Adverse>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Prvalue32, Shape::Random>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Prvalue32, Shape::Adverse>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Prvalue64, Shape::Random>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Prvalue256, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter16, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter16, Shape::Adverse>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter32, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter32, Shape::Adverse>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter64, Shape::Random>)->Apply(common_arg);
+BENCHMARK(bm<Kind::FatIter64, Shape::Adverse>)->Apply(common_arg);
 BENCHMARK(bm<Kind::Iota, Shape::Random>)->Apply(common_arg);
 BENCHMARK(bm<Kind::ExpensiveRef, Shape::Random>)->Apply(common_arg);
 
