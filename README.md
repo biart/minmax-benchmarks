@@ -72,6 +72,7 @@ Useful configure options:
 | --- | --- |
 | `build\bench-scenarios.exe` | the main matrix: element size, data ordering, `string`, `zip`, `join`, `join \| transform`, large prvalues, expensive reference derefs |
 | `build\bench-size_map.exe` | `sizeof(It)` × `sizeof(V)` sweep with a synthetic `fat_iterator`, plus real-range anchors |
+| `build\bench-summary.exe` | the short representative set (18 rows, `min` only) for comparing patched STL builds; public API only, so the same source measures whichever STL it is built against |
 | `build\bench-ranges_minmax.exe` | a self-contained benchmark in the STL suite's own style, intended for upstreaming as `benchmarks/src/ranges_minmax.cpp` — it calls the public API only |
 | `build\probe.exe` | which branch the installed STL takes for each element type, and whether the vectorized paths apply |
 | `build\iterators.exe` | `sizeof`, reference-ness and heuristic verdict for real ranges and views |
