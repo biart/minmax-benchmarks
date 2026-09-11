@@ -72,10 +72,11 @@ Useful configure options:
 | --- | --- |
 | `build\bench-scenarios.exe` | the main matrix: element size, data ordering, `string`, `zip`, `join`, `join \| transform`, large prvalues, expensive reference derefs |
 | `build\bench-size_map.exe` | `sizeof(It)` × `sizeof(V)` sweep with a synthetic `fat_iterator`, plus real-range anchors |
-| `build\bench-summary.exe` | the short representative set (18 rows, `min` only) for comparing patched STL builds; public API only, so the same source measures whichever STL it is built against |
+| `build\bench-summary.exe` | the short representative set (28 rows, `min` only) for comparing patched STL builds; public API only, so the same source measures whichever STL it is built against. Read it together with `verdicts.exe`: only rows whose branch changes are evidence (see Caveats) |
 | `build\bench-ranges_minmax.exe` | a self-contained benchmark in the STL suite's own style, intended for upstreaming as `benchmarks/src/ranges_minmax.cpp` — it calls the public API only |
 | `build\probe.exe` | which branch the installed STL takes for each element type, and whether the vectorized paths apply |
 | `build\iterators.exe` | `sizeof`, reference-ness and heuristic verdict for real ranges and views |
+| `build\verdicts.exe` | which `bench-summary` rows change branch between the shipping heuristic and the proposed one |
 | `build\zip_types.exe` | why `zip`'s `iter_value_t` cannot be a tuple of references |
 | `build\asm_probe.exe` | per-track timings for synthetic iterators and element sizes, one noinline function each |
 | `build\asm_real.exe` | the same for real ranges (vector, deque, join, iota, transform) |
@@ -97,15 +98,21 @@ inc/minmax_tracks.hpp   the tracks, transcribed from microsoft/STL and libstdc++
 inc/synthetic.hpp       sized_value<Bytes> and fat_iterator<T, Bytes, fatness>
 src/scenarios.cpp       the main matrix
 src/size_map.cpp        the iterator-size / value-size sweep
+src/summary.cpp         the representative set for A/B-ing patched STL builds
 upstream/               the benchmark proposed for the STL's own suite
 probe/                  disassembly and type-inspection probes
 ```
 
 ## Findings, in brief
 
-- **`sizeof(_It)` does not predict anything.** Synthetic iterators of 8, 16, 32 and 64 bytes emit
-  byte-identical loops; the padding is scalarized away and the iterator lives in one register
-  regardless. Real iterators differ because their *dereference* differs, not their size.
+- **`sizeof(_It)` is not the cost, but the term is worth keeping.** Synthetic iterators padded to
+  8, 16, 32 and 64 bytes emit byte-identical loops; the padding is scalarized away. What costs is
+  the dereference. But iterators larger than a pointer usually dereference through base + offset
+  or a block map (`deque`, `join`, the `live` `fat_iterator`), and on today's MSVC the iterator
+  branch performs `2N - 1` such loads. Dropping the term would send a 32-byte `live` iterator to the
+  iterator branch at a 13x loss (1500 ns -> 20617 ns, `bench-summary`, `FatIter32`). The term is a
+  proxy, and an incomplete one: a 16-byte `live` iterator passes it and is just as slow as the
+  32-byte one. `iter_hoist` shows the whole penalty is the missed hoist, not the addressing.
 - **What costs is the dereference count**, and its price is user-controlled and unbounded — a
   `views::transform` can put an allocation or a nested reduction behind `*it`.
 - The iterator branch is additionally penalised on MSVC today because `*found` is reloaded through
@@ -114,6 +121,16 @@ probe/                  disassembly and type-inspection probes
 - Caching values loses only when the assignment is a *copy* rather than a move **and** the input is
   close to sorted. `vector<string>`, `zip`, and prvalues larger than the register file are the
   cases where it happens.
+- **The shipping value branch is not one-dereference.** It re-dereferences `*first` on every
+  improvement, so in adverse order it costs as much as the iterator branch when the dereference is
+  expensive: for an allocating prvalue, `prv/heap/descending` measures `value` 359709 ns against
+  `iter` 362697 ns, while `value1x` measures 189545 ns. Any change that routes expensive prvalues
+  to the value branch needs the `value1x` loop shape to actually deliver one dereference per element.
+- **One regression found.** Moving a 16-byte prvalue range to the value branch costs
+  `ranges::minmax` 54% at N = 20 (4.5-4.9 ns -> 7.0-7.1 ns, 5 repetitions, non-overlapping) and
+  `views::iota` minmax 19% at the same N; the same rows improve 54% to 81% at N = 8021. The minmax
+  value branch keeps two `range_value_t` members and constructs a third per pair, and at N = 20
+  that fixed cost is not amortized (`upstream/ranges_minmax.cpp`).
 
 ## Caveats
 
@@ -121,6 +138,12 @@ Everything here was measured on one machine: MSVC 19.51 x64, `/O2`, no `/arch:` 
 no ARM64. Most rows benchmark `min` only. Some numbers depend on hardware more than they look —
 the auto-vectorization seen in `probe/asm_probe.cpp` is dispatched at runtime on
 `__isa_available >= 6` (AVX-512), so the same binary takes a scalar path elsewhere.
+
+`bench-summary` compares whole binaries. Changing `_Prefer_iterator_copies` changes which template
+bodies are instantiated across the translation unit, which moves the code layout of every other
+loop: rows whose branch does not change still shift by tens of percent (`deque<double>` measured
+-20% and +45% in the same comparison, non-overlapping distributions). Only rows that `verdicts.exe`
+reports as changing branch are evidence, and comparisons should use minimums, not medians.
 
 Four measurement artifacts were found and fixed during this work, each of which produced a
 plausible but meaningless number: a defaulted `operator<=>` adding five instructions to the
